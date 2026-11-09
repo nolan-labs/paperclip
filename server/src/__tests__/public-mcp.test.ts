@@ -1017,7 +1017,14 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     app.use((req, _res, next) => { req.actor = f.actor; next(); }); app.use("/api", publicMcpManagementRoutes(oauth));
     const discovery = await request(app).get("/.well-known/oauth-authorization-server");
     expect(discovery.body.code_challenge_methods_supported).toEqual(["S256"]);
-    expect((await request(app).post("/mcp/paperclip").send({})).status).toBe(401);
+    expect(discovery.body.scopes_supported).toContain("offline_access");
+    for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp/paperclip"]) {
+      const metadata = await request(app).get(path);
+      expect(metadata.body.scopes_supported).toContain("offline_access");
+    }
+    const unauthenticated = await request(app).post("/mcp/paperclip").send({});
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers["www-authenticate"]).toContain('scope="paperclip:read paperclip:write paperclip:configure offline_access"');
     const rpc = (method: string, params?: unknown) => request(app).post("/mcp/paperclip").timeout({ response: 5000, deadline: 7000 }).set("Authorization", `Bearer ${f.tokens.access_token}`).set("Accept", "application/json, text/event-stream").send({ jsonrpc: "2.0", id: 1, method, ...(params ? { params } : {}) });
     expect((await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1" } })).body.result.serverInfo.name).toBe("paperclip");
     const catalog = await rpc("tools/list");
