@@ -385,6 +385,29 @@ export async function githubGuestBotConnectionForSession(
   >,
 ): Promise<string | null> {
   if (!session.runId || !session.agentId || !session.issueId) return null;
+  const [githubConversation] = await db
+    .select({ id: chatConversations.id })
+    .from(chatConversations)
+    .innerJoin(
+      chatEndpoints,
+      and(
+        eq(chatEndpoints.id, chatConversations.endpointId),
+        eq(chatEndpoints.companyId, session.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(chatConversations.companyId, session.companyId),
+        eq(chatConversations.issueId, session.issueId),
+        eq(chatEndpoints.assignedAgentId, session.agentId),
+        eq(chatEndpoints.provider, "github"),
+      ),
+    )
+    .limit(1);
+  // Sponsorship requires a GitHub conversation on the current task. Ordinary
+  // MCP-only tasks must not inherit an unrelated channel provenance failure.
+  // When a candidate exists, full requester and task authority checks still run.
+  if (!githubConversation) return null;
   const [run] = await db
     .select({
       id: heartbeatRuns.id,

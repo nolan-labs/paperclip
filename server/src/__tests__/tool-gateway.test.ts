@@ -8,6 +8,8 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
+  chatConversations,
+  chatEndpoints,
   companySecretBindings,
   companySecrets,
   companySecretVersions,
@@ -22,6 +24,7 @@ import {
   issues,
   principalPermissionGrants,
   projects,
+  runIdentityContexts,
   toolAccessAuditEvents,
   toolActionRequests,
   toolApplications,
@@ -128,6 +131,52 @@ async function createIssueAndRun(db: Db, companyId: string, agentId: string) {
     .returning()
     .then((rows) => rows[0]!);
   return { project, issue, run };
+}
+
+async function continueRunFromAnotherTask(
+  db: Db,
+  input: { companyId: string; agentId: string; projectId: string; issueId: string; runId: string },
+) {
+  const [sourceIssue] = await db.insert(issues).values({
+    companyId: input.companyId,
+    projectId: input.projectId,
+    title: `Previous task ${randomUUID()}`,
+    assigneeAgentId: input.agentId,
+  }).returning();
+  const [sourceRun] = await db.insert(heartbeatRuns).values({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    status: "succeeded",
+    nativeIssueId: sourceIssue.id,
+    responsibleUserId: "requester",
+    contextSnapshot: {},
+  }).returning();
+  const [origin] = await db.insert(runIdentityContexts).values({
+    companyId: input.companyId,
+    runId: sourceRun.id,
+    revision: 1,
+    status: "accepted",
+    responsibleUserId: "requester",
+    messageId: randomUUID(),
+    cause: "instruction",
+    correlationId: "message",
+  }).returning();
+  const [context] = await db.insert(runIdentityContexts).values({
+    companyId: input.companyId,
+    runId: input.runId,
+    revision: 1,
+    status: "accepted",
+    responsibleUserId: "requester",
+    parentContextId: origin.id,
+    cause: "monitor",
+    correlationId: "dispatch",
+  }).returning();
+  const [run] = await db.update(heartbeatRuns).set({
+    nativeIssueId: input.issueId,
+    responsibleUserId: "requester",
+    activeIdentityContextId: context.id,
+  }).where(eq(heartbeatRuns.id, input.runId)).returning();
+  return { sourceIssue, sourceRun, origin, context, run };
 }
 
 async function createActiveMember(db: Db, companyId: string, userId: string) {
@@ -572,6 +621,8 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     await db.delete(toolProfileEntries);
     await db.delete(toolProfileBindings);
     await db.delete(toolProfiles);
+    await db.delete(chatConversations);
+    await db.delete(chatEndpoints);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
     await db.delete(secretAccessEvents);
@@ -582,6 +633,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     await db.delete(userSecretDefinitions);
     await db.delete(issueThreadInteractions);
     await db.delete(agentWakeupRequests);
+    await db.delete(runIdentityContexts);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);
@@ -1384,6 +1436,97 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       entityId: issue.id,
       agentId: agent.id,
       runId: run.id,
+    });
+  });
+
+  it("keeps unrelated MCP discovery and read-only execution available on a non-GitHub cross-task continuation", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { project, issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await continueRunFromAnotherTask(db, {
+      companyId: company.id,
+      agentId: agent.id,
+      projectId: project.id,
+      issueId: issue.id,
+      runId: run.id,
+    });
+    await createActiveMember(db, company.id, "requester");
+    const remote = await startFakeRemoteMcpServer(({ body }) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: body?.id,
+        result: { content: [{ type: "text", text: "read ok" }] },
+      },
+    }));
+    try {
+      const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        url: remote.url,
+        applicationKey: "cross-task-mcp",
+        toolName: "read_note",
+        riskLevel: "read",
+      });
+      await db.update(toolCatalogEntries).set({
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      }).where(eq(toolCatalogEntries.id, catalogEntry.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const toolName = expectedConnectedToolName({
+        applicationKey: application.applicationKey,
+        connectionId: connection.id,
+        toolName: catalogEntry.toolName,
+      });
+
+      const tools = await gateway.listToolsForSession(session.token);
+      expect(tools.map((tool) => tool.name)).toContain(toolName);
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: toolName,
+        parameters: {},
+      })).resolves.toMatchObject({
+        status: "completed",
+        result: { content: "read ok" },
+      });
+    } finally {
+      await remote.close();
+    }
+  });
+
+  it("preserves cross-task authority rejection when the current task has a GitHub conversation", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { project, issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await continueRunFromAnotherTask(db, {
+      companyId: company.id,
+      agentId: agent.id,
+      projectId: project.id,
+      issueId: issue.id,
+      runId: run.id,
+    });
+    const remote = await createRemoteMcpTool(db, company.id);
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const [endpoint] = await db.insert(chatEndpoints).values({
+      companyId: company.id,
+      connectionId: remote.connection.id,
+      provider: "github",
+      publicId: randomUUID(),
+      assignedAgentId: agent.id,
+      status: "active",
+    }).returning();
+    await db.insert(chatConversations).values({
+      companyId: company.id,
+      endpointId: endpoint.id,
+      issueId: issue.id,
+      externalConversationId: "paperclipai/paperclip",
+      externalThreadId: randomUUID(),
+      externalLabel: "Cross-task GitHub conversation",
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    await expect(gateway.listToolsForSession(session.token)).rejects.toMatchObject({
+      status: 403,
+      message: "Chat tools cannot be inherited by another task",
     });
   });
 

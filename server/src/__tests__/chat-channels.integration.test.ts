@@ -28,7 +28,7 @@ import { resolveGitHubReviewInstructions } from "../services/chat-channels/githu
 import { githubResponseCommentService } from "../services/chat-github-response-comments.js";
 import { githubReviewCheckService } from "../services/chat-github-checks.js";
 import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
-import { githubBotToolsForSession, syncGitHubBotTools } from "../services/chat-github-tools.js";
+import { githubBotToolsForSession, githubGuestBotConnectionForSession, syncGitHubBotTools } from "../services/chat-github-tools.js";
 import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat/run-preparation.js";
 import { createAssignedMcpTools } from "../services/native-runtime/assigned-mcp-tools.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
@@ -5521,6 +5521,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         })
         .returning();
       await initializeRunIdentity(db, { companyId: f.companyId, runId: run.id, issueId: task.id, responsibleUserId: "owner-user", cause: "issue_responsible_user" });
+      await expect(githubGuestBotConnectionForSession(db, {
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        runId: run.id,
+        issueId: task.id,
+      })).resolves.toBe(f.endpoint.connectionId);
       const exported = await resolveGitHubOperationCredentials(db, { companyId: f.companyId, agentId: f.assignedAgentId, runId: run.id });
       expect(exported.status).toBe("unavailable");
       expect(exported.env).toEqual({});
