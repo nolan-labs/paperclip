@@ -1,3 +1,8 @@
+import type { PluginWorkspaceParams, PluginWorkspaceResult } from "./workspace-provider.js";
+import type { PluginEnvironmentTaskParams, PluginEnvironmentTaskResult } from "./environment-tasks.js";
+import type { PluginAgentRuntimeState } from "./types.js";
+import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
+import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
  * channel.
@@ -30,7 +35,7 @@ import type {
   IssueAssigneeAdapterOverrides,
   IssueAttachment,
   IssueThreadInteraction,
-  CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   Approval,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
@@ -53,6 +58,8 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
+  ResourceLifecycleEvent,
+  ResourceLifecycleResult,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -614,8 +621,28 @@ export interface PluginEnvironmentLease {
   expiresAt?: string | null;
 }
 
+/** Serializable provider result. The host adds refresh/close lifecycle methods. */
+export interface PluginEnvironmentRunnerIngressEndpoint {
+  kind: "authenticated_websocket";
+  websocketUrl: string;
+  secretHeaders: Array<{ name: string; value: string }>;
+  generation: string;
+}
+
+export interface PluginEnvironmentRunnerIngressEndpointParams
+  extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  port: number;
+  path: string;
+}
+
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   runId: string;
+  /** Explicit platform probes may request a provider-owned immutable snapshot
+   * identity. Supporting providers create by that ID and return snapshotIdentity
+   * in lease metadata. Older providers may omit it; the host then cannot qualify
+   * a mutable snapshot name. Ordinary discovery must not allocate a sandbox. */
+  resolveSnapshotIdentity?: boolean;
   workspaceMode?: string;
   requestedCwd?: string;
   agentId?: string;
@@ -647,11 +674,36 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /** Stop the exact allocation while preserving its files, regardless of its
+   * ordinary release policy. A failed stop must throw, never fall back to delete. */
+  resourceDisposition?: "stop_and_retain";
+  /** Explicit operator cancellation: terminate active work instead of waiting
+   * for command/sync activity to drain. Still requires a provider receipt. */
+  cancelActiveWork?: boolean;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
 }
 
+/** Returned only after the provider confirms that execution has ended. A queued
+ * stop request or successful local cleanup is not a termination receipt. */
+export interface PluginEnvironmentTerminationReceipt {
+  providerLeaseId: string;
+  state: "stopped" | "destroyed";
+}
+
 export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentReleaseLeaseParams {}
+
+/** Observe this exact allocation without starting, stopping or deleting it.
+ * Missing resources must be distinguished from permission/transport failures. */
+export interface PluginEnvironmentInspectLeaseParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string;
+  leaseMetadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentLeaseObservation {
+  providerLeaseId: string;
+  state: "active" | "stopped" | "destroyed" | "unknown";
+}
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
@@ -682,6 +734,10 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  /** Optional total command execution budget, in milliseconds. A session
+   * provider must keep this distinct from individual observation timeouts.
+   * Zero disables this deadline. Absence keeps the existing session lifetime. */
+  commandTimeoutMs?: number;
   /**
    * Run this command outside the lease's persistent session.
    *
@@ -725,8 +781,17 @@ export interface PluginSyncFileMapping {
   kind: "file" | "directory";
   /**
    * POSIX file mode to apply at the target (e.g. `0o600` for secret material).
-   * When set, providers MUST create the target with this mode with no
-   * world-readable window (create-with-mode or chmod-before-bytes, never after).
+   * The target MUST carry this mode when the transfer completes.
+   *
+   * For a transfer to a host target, providers MUST apply the mode with no
+   * world-readable window: create the target with the mode, or apply the mode
+   * before the bytes arrive at the target path. A host file sits outside the
+   * sandbox boundary, so an open window shows the bytes to other host
+   * processes.
+   *
+   * For a transfer to a sandbox target, providers MAY apply the mode after
+   * they write the bytes. The sandbox is the trust boundary, so a short window
+   * shows the bytes only to code that already runs in that sandbox.
    */
   mode?: number;
   /** Glob patterns to exclude when `kind` is `"directory"`. */
@@ -991,7 +1056,7 @@ export interface PluginRenderCloseEvent {
  * key to a compile-time command. The open request carries no command string, so a
  * caller cannot select or override the command.
  */
-export type PluginLoginCommandKey = "claude" | "codex";
+export type PluginLoginCommandKey = "claude" | "codex" | "grok";
 
 /** The open request for one live login pseudo-terminal. The worker registers the terminal by `hostRouteId`. */
 export interface PluginLoginPtyOpenParams {
@@ -1062,6 +1127,12 @@ export interface PluginLoginPtyCloseResult {
 
 /** The worker→host pseudo-terminal output notification parameters. Modeled on `execute.log`. */
 export interface PluginLoginPtyOutputParams {
+  /**
+   * The host route identifier the open request carried. The worker echoes it,
+   * so the host can hold more than one concurrent login pseudo-terminal per
+   * worker and route each chunk to its own route.
+   */
+  hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
   /** The raw terminal output bytes. */
@@ -1070,6 +1141,12 @@ export interface PluginLoginPtyOutputParams {
 
 /** The worker→host pseudo-terminal exit notification parameters. */
 export interface PluginLoginPtyExitParams {
+  /**
+   * The host route identifier the open request carried. The worker echoes it,
+   * so the host can hold more than one concurrent login pseudo-terminal per
+   * worker and resolve the exit against its own route.
+   */
+  hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
   /** The child exit code, or null when the child ended with no code. */
@@ -1098,6 +1175,50 @@ export interface PluginLoginPtyWorkerSession {
 export const LOGIN_PTY_OUTPUT_NOTIFICATION = "loginPty.output";
 /** The worker→host notification method for one pseudo-terminal exit. */
 export const LOGIN_PTY_EXIT_NOTIFICATION = "loginPty.exit";
+
+// ---------------------------------------------------------------------------
+// Byte-safe duplex channel wire representation.
+// ---------------------------------------------------------------------------
+// A JSON-RPC message travels as one line of JSON text (see `serializeMessage`
+// below). JSON has no binary type, so a raw byte chunk cannot cross this hop
+// unchanged. `ChannelBytesWireValue` is the one JSON-safe encoding this
+// protocol uses for a duplex channel chunk: a base64 string.
+//
+// Every layer above this hop carries the chunk as `Uint8Array`. This includes
+// the plugin context, the worker RPC host's public duplex methods, and the
+// host-side plugin worker manager. Only the JSON-RPC message itself holds the
+// base64 form, and only for the one hop between the host process and the
+// worker process.
+//
+// This base64 form is not the sandbox provider channel's wire format. That
+// channel carries raw bytes with no base64 armor: a live measurement of the
+// provider transport proved that every byte value survives it unchanged.
+//
+// HTTP/2 is the preferred transport. `queue_v1` is the soft-deprecated fallback.
+
+/** The wire-safe JSON-RPC form of one duplex channel byte chunk: a base64 string. */
+export type ChannelBytesWireValue = string;
+
+/** Encodes raw channel bytes into the wire-safe JSON-RPC representation. */
+export function encodeChannelBytes(bytes: Uint8Array): ChannelBytesWireValue {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+}
+
+/**
+ * Decodes the wire-safe JSON-RPC representation back to raw channel bytes.
+ * Returns `null` for a value that is not a well-formed base64 string, so a
+ * caller on the trust boundary treats a malformed frame as a protocol error
+ * instead of silently substituting the empty byte array.
+ */
+export function decodeChannelBytes(value: unknown): Uint8Array | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  // `Buffer.from(str, "base64")` silently drops an invalid character instead
+  // of throwing, so re-encode the decoded bytes and compare. A well-formed
+  // base64 string round-trips to itself; a malformed one does not.
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) return null;
+  return new Uint8Array(decoded.buffer, decoded.byteOffset, decoded.byteLength);
+}
 
 // ---------------------------------------------------------------------------
 // Generic duplex channel worker methods.
@@ -1150,8 +1271,8 @@ export interface PluginDuplexChannelWriteParams {
   hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
-  /** The raw input bytes to write to the channel. */
-  data: string;
+  /** The raw input bytes to write to the channel, in the {@link ChannelBytesWireValue} wire form. */
+  data: ChannelBytesWireValue;
 }
 
 /** The stop request. It carries the exact route pair. */
@@ -1196,8 +1317,8 @@ export interface PluginDuplexChannelDataParams {
   hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
-  /** The raw channel output bytes. */
-  chunk: string;
+  /** The raw channel output bytes, in the {@link ChannelBytesWireValue} wire form. */
+  chunk: ChannelBytesWireValue;
 }
 
 /** The worker→host duplex channel exit notification parameters. */
@@ -1235,6 +1356,8 @@ export interface HostToWorkerMethods {
   health: [params: Record<string, never>, result: PluginHealthDiagnostics];
   /** @see PLUGIN_SPEC.md §12.5 */
   shutdown: [params: Record<string, never>, result: void];
+  prepareIdleSleep: [params: { ownerId: string; expiresAt: number }, result: { ownerId: string; expiresAt: number; backgroundWork: "none" | "present" | "unknown" }];
+  releaseIdleSleep: [params: { ownerId: string }, result: void];
   /** @see PLUGIN_SPEC.md §13.3 */
   validateConfig: [params: ValidateConfigParams, result: PluginConfigValidationResult];
   /** @see PLUGIN_SPEC.md §13.4 */
@@ -1248,6 +1371,8 @@ export interface HostToWorkerMethods {
   /** Scoped plugin API route dispatch. */
   handleApiRequest: [params: PluginApiRequestInput, result: PluginApiResponse];
   /** @see PLUGIN_SPEC.md §13.8 */
+  agentLifecycle: [params: AgentLifecycleRequest, result: AgentLifecycleResult];
+  resourceLifecycle: [params: ResourceLifecycleEvent, result: ResourceLifecycleResult];
   getData: [params: GetDataParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.9 */
   performAction: [params: PerformActionParams, result: unknown];
@@ -1257,6 +1382,7 @@ export interface HostToWorkerMethods {
     params: DetectExternalObjectsParams,
     result: DetectExternalObjectsResult,
   ];
+  routeAiConnection: [params: AiConnectionRouterRequest, result: AiConnectionRouterResult];
   resolveExternalObject: [
     params: ResolveExternalObjectParams,
     result: PluginExternalObjectResolveResult,
@@ -1269,6 +1395,8 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentValidateConfigParams,
     result: PluginEnvironmentValidationResult,
   ];
+  workspaceOperation: [params: PluginWorkspaceParams, result: PluginWorkspaceResult];
+  environmentTask: [params: PluginEnvironmentTaskParams, result: PluginEnvironmentTaskResult];
   environmentProbe: [
     params: PluginEnvironmentProbeParams,
     result: PluginEnvironmentProbeResult,
@@ -1283,11 +1411,19 @@ export interface HostToWorkerMethods {
   ];
   environmentReleaseLease: [
     params: PluginEnvironmentReleaseLeaseParams,
-    result: void,
+    result: PluginEnvironmentTerminationReceipt | void,
+  ];
+  environmentStopLease: [
+    params: PluginEnvironmentReleaseLeaseParams,
+    result: PluginEnvironmentTerminationReceipt,
   ];
   environmentDestroyLease: [
     params: PluginEnvironmentDestroyLeaseParams,
-    result: void,
+    result: PluginEnvironmentTerminationReceipt | void,
+  ];
+  environmentInspectLease: [
+    params: PluginEnvironmentInspectLeaseParams,
+    result: PluginEnvironmentLeaseObservation,
   ];
   environmentRealizeWorkspace: [
     params: PluginEnvironmentRealizeWorkspaceParams,
@@ -1296,6 +1432,10 @@ export interface HostToWorkerMethods {
   environmentExecute: [
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
+  ];
+  environmentRunnerIngressEndpoint: [
+    params: PluginEnvironmentRunnerIngressEndpointParams,
+    result: PluginEnvironmentRunnerIngressEndpoint,
   ];
   environmentSyncIn: [
     params: PluginEnvironmentSyncInParams,
@@ -1367,26 +1507,36 @@ export const HOST_TO_WORKER_REQUIRED_METHODS: readonly HostToWorkerMethodName[] 
 
 /** Optional methods the worker MAY implement. */
 export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] = [
+  "prepareIdleSleep",
+  "releaseIdleSleep",
   "validateConfig",
   "configChanged",
   "onEvent",
   "runJob",
   "handleWebhook",
   "handleApiRequest",
+  "agentLifecycle",
+  "resourceLifecycle",
+  "workspaceOperation",
   "getData",
   "performAction",
   "executeTool",
   "detectExternalObjects",
+  "routeAiConnection",
   "resolveExternalObject",
   "refreshExternalObjects",
   "environmentValidateConfig",
+  "environmentTask",
   "environmentProbe",
   "environmentAcquireLease",
   "environmentResumeLease",
   "environmentReleaseLease",
+  "environmentStopLease",
   "environmentDestroyLease",
+  "environmentInspectLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
+  "environmentRunnerIngressEndpoint",
   "environmentSyncIn",
   "environmentSyncOut",
   "environmentStartInteractiveSetup",
@@ -1536,6 +1686,8 @@ export interface WorkerToHostMethods {
   ];
 
   // Events
+  "events.listLifecycle": [params: { companyId: string; limit?: number; afterId?: string }, result: ResourceLifecycleEvent[]];
+  "events.acknowledgeLifecycle": [params: { companyId: string; eventId: string }, result: void];
   "events.emit": [
     params: { name: string; companyId: string; payload: unknown },
     result: void,
@@ -1641,6 +1793,10 @@ export interface WorkerToHostMethods {
   "projects.list": [
     params: { companyId: string; limit?: number; offset?: number },
     result: Project[],
+  ];
+  "projects.getInstanceSecrets": [
+    params: { projectId: string; companyId: string },
+    result: Record<string, string>,
   ];
   "projects.get": [
     params: { projectId: string; companyId: string },
@@ -1900,7 +2056,7 @@ export interface WorkerToHostMethods {
     params: {
       issueId: string;
       companyId: string;
-      interaction: CreateIssueThreadInteraction;
+      interaction: CreateIssueThreadInteractionInput;
       authorAgentId?: string | null;
     },
     result: IssueThreadInteraction,
@@ -1989,6 +2145,10 @@ export interface WorkerToHostMethods {
   "agents.list": [
     params: { companyId: string; status?: string; limit?: number; offset?: number },
     result: Agent[],
+  ];
+  "agents.getRuntime": [
+    params: { agentId: string; companyId: string },
+    result: PluginAgentRuntimeState | null,
   ];
   "agents.get": [
     params: { agentId: string; companyId: string },
